@@ -409,6 +409,174 @@ export function bindClaudeSession(
   resumeByThread.set(threadId, { sessionId, cwd, providerAccountId });
 }
 
+/**
+ * Records in a stored session file that carry conversation content. The rest —
+ * modes, file snapshots, queue operations, generated titles — is bookkeeping
+ * the transcript never showed in the first place.
+ */
+function isReplayableRecord(rec: Record<string, unknown>): boolean {
+  const type = rec.type;
+  if (type !== "user" && type !== "assistant") return false;
+  // Subagent traffic is already represented by the Agent tool row on the
+  // parent message; replaying it too would duplicate the work inline.
+  return rec.isSidechain !== true;
+}
+
+/**
+ * The prompt a person typed, or nothing when this record is a tool result
+ * wearing the user role — those are answers to the agent's own calls and are
+ * replayed through `handleLine` onto their tool rows instead.
+ */
+function userPromptText(rec: Record<string, unknown>): string | undefined {
+  const message = rec.message as Record<string, unknown> | undefined;
+  const content = message?.content;
+  if (typeof content === "string") return content.trim() || undefined;
+  if (!Array.isArray(content)) return undefined;
+  const blocks = content as Array<Record<string, unknown>>;
+  if (blocks.some((block) => block?.type === "tool_result")) return undefined;
+  const text = blocks
+    .filter((block) => block?.type === "text")
+    .map((block) => (typeof block.text === "string" ? block.text : ""))
+    .join("\n")
+    .trim();
+  return text || undefined;
+}
+
+/**
+ * Rebuild a thread's transcript from a conversation Claude stored on disk.
+ *
+ * The stored records are the same shape as the ones the live process streams,
+ * so they go through `handleLine` unchanged and produce the same events —
+ * including tool rows and subagent steps. Passing the MonoCode thread id also
+ * means `handleLine` records the resume binding on its own, from `cwd`, so that
+ * has to be the directory the next turn will run in: the working copy, not the
+ * project root a worktree session is filed under.
+ */
+export function replayClaudeSession(input: {
+  sessionId: string;
+  /** Directory the next turn runs in; the binding replay records is keyed to it. */
+  cwd: string;
+  providerAccountId?: string;
+  runtimeMode: RuntimeMode;
+  transcript: string;
+  onEvent: (event: HarnessEvent) => void;
+  /** A prompt someone typed. These are blocks, not events, so the caller adds
+   * them to the transcript itself. */
+  onPrompt: (text: string, at?: number) => void;
+}): void {
+  // Two things can leave a reply open. `handleLine` holds its own boundary for
+  // a message carrying text, but a later tool-only record overwrites it; and
+  // live the final reply is closed by the turn's `result` message, which a
+  // stored conversation has no equivalent of. Watching what was actually
+  // emitted covers both without closing the same message twice.
+  let openReply = false;
+  const emit = (event: HarnessEvent) => {
+    if (event.type === "message.delta") openReply = true;
+    if (event.type === "message.completed") openReply = false;
+    input.onEvent(event);
+  };
+
+  const live = newLiveState({
+    cwd: input.cwd,
+    claudeSessionId: "",
+    providerAccountId: input.providerAccountId,
+    runtimeMode: input.runtimeMode,
+    planning: false,
+    settingsKey: "",
+    onEvent: emit,
+  });
+  live.initialized = true;
+
+  const finishReply = () => {
+    closePendingAssistantMessage(live);
+    if (openReply) emit({ type: "message.completed" });
+  };
+
+  for (const line of input.transcript.split("\n")) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    let rec: Record<string, unknown>;
+    try {
+      rec = JSON.parse(trimmed) as Record<string, unknown>;
+    } catch {
+      continue;
+    }
+    if (!isReplayableRecord(rec)) continue;
+
+    const prompt = rec.type === "user" ? userPromptText(rec) : undefined;
+    if (prompt) {
+      // End the reply this prompt follows, so the turns stay separate blocks.
+      finishReply();
+      input.onPrompt(prompt, timestampOf(rec));
+      continue;
+    }
+
+    handleLine(input.sessionId, live, trimmed);
+  }
+  finishReply();
+}
+
+function timestampOf(rec: Record<string, unknown>): number | undefined {
+  const raw = rec.timestamp;
+  if (typeof raw !== "string") return undefined;
+  const parsed = Date.parse(raw);
+  return Number.isNaN(parsed) ? undefined : parsed;
+}
+
+/**
+ * Every field of a fresh `Live`. Shared so that replaying a stored transcript
+ * runs against exactly the same state the live stream builds, rather than a
+ * second copy that drifts as the streaming path grows.
+ */
+function newLiveState(input: {
+  cwd: string;
+  claudeSessionId: string;
+  providerAccountId?: string;
+  runtimeMode: RuntimeMode;
+  planning: boolean;
+  settingsKey: string;
+  onEvent: (event: HarnessEvent) => void;
+}): Live {
+  return {
+    cwd: input.cwd,
+    claudeSessionId: input.claudeSessionId,
+    providerAccountId: input.providerAccountId,
+    runtimeMode: input.runtimeMode,
+    planning: input.planning,
+    settingsKey: input.settingsKey,
+    onEvent: input.onEvent,
+    approvals: new Map(),
+    questions: new Map(),
+    visibleQuestionId: null,
+    nextApprovalUiId: 1,
+    nextControlId: 1,
+    toolsByIndex: new Map(),
+    toolsById: new Map(),
+    agentTasks: new Map(),
+    backgroundTasks: new Map(),
+    backgroundRows: new Map(),
+    awaitingResume: null,
+    backgroundKey: "",
+    taskNotes: [],
+    turnResultSeen: false,
+    usageLimit: null,
+    cancelled: false,
+    muteUpdates: false,
+    turns: Promise.resolve(),
+    turnDone: null,
+    turnFailed: null,
+    turnEndPending: false,
+    activeTurn: false,
+    initDone: null,
+    initialized: false,
+    emittedAssistant: "",
+    emittedReasoning: "",
+    pendingAssistantBoundary: false,
+    manualCompaction: false,
+    compactionConfirmed: false,
+  };
+}
+
 async function ensureLive(
   input: HarnessSessionInput,
   retriedWithoutResume = false,
@@ -460,7 +628,7 @@ async function ensureLive(
     claudeSessionId,
   );
 
-  const live: Live = {
+  const live: Live = newLiveState({
     cwd: input.cwd,
     claudeSessionId,
     providerAccountId: input.providerAccountId,
@@ -468,36 +636,7 @@ async function ensureLive(
     planning,
     settingsKey,
     onEvent: input.onEvent,
-    approvals: new Map(),
-    questions: new Map(),
-    visibleQuestionId: null,
-    nextApprovalUiId: 1,
-    nextControlId: 1,
-    toolsByIndex: new Map(),
-    toolsById: new Map(),
-    agentTasks: new Map(),
-    backgroundTasks: new Map(),
-    backgroundRows: new Map(),
-    awaitingResume: null,
-    backgroundKey: "",
-    taskNotes: [],
-    turnResultSeen: false,
-    usageLimit: null,
-    cancelled: false,
-    muteUpdates: false,
-    turns: Promise.resolve(),
-    turnDone: null,
-    turnFailed: null,
-    turnEndPending: false,
-    activeTurn: false,
-    initDone: null,
-    initialized: false,
-    emittedAssistant: "",
-    emittedReasoning: "",
-    pendingAssistantBoundary: false,
-    manualCompaction: false,
-    compactionConfirmed: false,
-  };
+  });
   liveRef.current = live;
 
   const resumeMissing = { current: false };
@@ -994,8 +1133,7 @@ function handleResult(live: Live, rec: Record<string, unknown>): void {
   // A refused window can still fall back to another model, so only a turn
   // that ended in error was stopped by it.
   const turnErrored = rec.is_error === true || result.status === "failed";
-  const usageLimit =
-    live.usageLimit ?? (isUsageLimitResult(rec) ? {} : null);
+  const usageLimit = live.usageLimit ?? (isUsageLimitResult(rec) ? {} : null);
   live.usageLimit = null;
   if (usageLimit && turnErrored && !live.cancelled) {
     live.onEvent({ type: "usage.limited", ...usageLimit });
@@ -1012,10 +1150,7 @@ async function handleControlRequest(
   control: ClaudeControlRequest,
 ): Promise<void> {
   if (control.subtype !== "can_use_tool" && control.subtype !== "permission") {
-    await writeJson(
-      sessionId,
-      buildControlResponse(control.requestId, {}),
-    );
+    await writeJson(sessionId, buildControlResponse(control.requestId, {}));
     return;
   }
 
@@ -1417,10 +1552,7 @@ function noteSubagentTool(
  * never joins the parent transcript — that would read as the main agent
  * talking — but it is the most legible thing in the panel for its own row.
  */
-function noteSubagentNarration(
-  live: Live,
-  rec: Record<string, unknown>,
-): void {
+function noteSubagentNarration(live: Live, rec: Record<string, unknown>): void {
   const parent = subagentParent(live, rec);
   if (!parent) return;
   const model = stringField(asRecord(rec.message), "model");
@@ -1455,10 +1587,7 @@ function noteSubagentNarration(
 }
 
 /** Settles the subagent's own tool rows once their results come back. */
-function noteSubagentResults(
-  live: Live,
-  rec: Record<string, unknown>,
-): void {
+function noteSubagentResults(live: Live, rec: Record<string, unknown>): void {
   const parent = subagentParent(live, rec);
   if (!parent) return;
   for (const result of toolResultsFromUserMessage(rec)) {
@@ -1602,7 +1731,8 @@ function noteClaudeTurnStarted(live: Live): void {
 function showBackgroundRows(live: Live): void {
   if (!live.activeTurn || live.cancelled) return;
   for (const [taskId, task] of live.backgroundTasks) {
-    if (live.backgroundRows.has(taskId) || live.agentTasks.has(taskId)) continue;
+    if (live.backgroundRows.has(taskId) || live.agentTasks.has(taskId))
+      continue;
     const source = task.toolUseId
       ? live.toolsById.get(task.toolUseId)
       : undefined;
@@ -1616,7 +1746,9 @@ function showBackgroundRows(live: Live): void {
       kind: source ? toolKindFromName(source.name) : "execute",
       status: "in_progress",
       background: true,
-      ...(source ? { preview: previewFromTool(source.name, source.input) } : {}),
+      ...(source
+        ? { preview: previewFromTool(source.name, source.input) }
+        : {}),
     });
   }
 }

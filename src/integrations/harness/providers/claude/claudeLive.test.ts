@@ -58,11 +58,18 @@ const {
   respondClaudeQuestion,
   sendClaudeTurn,
   setClaudeBinaryResolver,
+  replayClaudeSession,
   stopClaudeSession,
   __claudeTestReset,
 } = await import("./claude");
+// Imports `claude.ts`, so it has to be loaded after the child mock like the rest.
+const { buildImportedSession } =
+  await import("../../../../features/sessions/model/claudeSessionImport");
 import type { HarnessEvent } from "../../core/types";
-import type { RuntimeMode, TurnIntent } from "../../../../features/sessions/model/session";
+import type {
+  RuntimeMode,
+  TurnIntent,
+} from "../../../../features/sessions/model/session";
 
 function parse() {
   return sent.map((line) => JSON.parse(line) as Record<string, unknown>);
@@ -264,7 +271,8 @@ function emitBashFinished(taskId = "b1") {
     task_id: taskId,
     tool_use_id: "toolu_bash",
     status: "completed",
-    summary: 'Background command "sleep 30 && echo done" completed (exit code 0)',
+    summary:
+      'Background command "sleep 30 && echo done" completed (exit code 0)',
   });
 }
 
@@ -666,6 +674,142 @@ describe("claude failed startup", () => {
       false,
     );
     expect(spawned).toHaveLength(1);
+  });
+});
+
+describe("claude session replay", () => {
+  function replay(records: Array<Record<string, unknown>>) {
+    const events: HarnessEvent[] = [];
+    const prompts: string[] = [];
+    replayClaudeSession({
+      sessionId: "s1",
+      cwd: "/repo",
+      runtimeMode: "supervised",
+      transcript: records.map((r) => JSON.stringify(r)).join("\n"),
+      onEvent: (event) => events.push(event),
+      onPrompt: (text) => prompts.push(text),
+    });
+    return { events, prompts };
+  }
+
+  it("rebuilds prompts, replies and tool rows from a stored conversation", () => {
+    const { events, prompts } = replay([
+      { type: "user", message: { role: "user", content: "ilk soru" } },
+      {
+        type: "assistant",
+        message: {
+          role: "assistant",
+          content: [{ type: "text", text: "cevap" }],
+        },
+      },
+      {
+        type: "assistant",
+        message: {
+          role: "assistant",
+          content: [
+            {
+              type: "tool_use",
+              id: "t1",
+              name: "Read",
+              input: { file_path: "/repo/a.ts" },
+            },
+          ],
+        },
+      },
+      {
+        type: "user",
+        message: {
+          role: "user",
+          content: [
+            { type: "tool_result", tool_use_id: "t1", content: "dosya" },
+          ],
+        },
+      },
+    ]);
+
+    expect(prompts).toEqual(["ilk soru"]);
+    expect(events.map((e) => e.type)).toEqual([
+      "message.delta",
+      "tool.started",
+      "tool.updated",
+      "message.completed",
+    ]);
+    const started = events[1] as Extract<
+      HarnessEvent,
+      { type: "tool.started" }
+    >;
+    expect(started.title).toBe("Read /repo/a.ts");
+    expect(started.kind).toBe("read");
+    const updated = events[2] as Extract<
+      HarnessEvent,
+      { type: "tool.updated" }
+    >;
+    expect(updated.status).toBe("completed");
+    expect(updated.detail).toBe("dosya");
+  });
+
+  it("closes the previous reply when the next prompt arrives", () => {
+    const { events, prompts } = replay([
+      { type: "user", message: { role: "user", content: "bir" } },
+      {
+        type: "assistant",
+        message: {
+          role: "assistant",
+          content: [{ type: "text", text: "ilk cevap" }],
+        },
+      },
+      { type: "user", message: { role: "user", content: "iki" } },
+      {
+        type: "assistant",
+        message: {
+          role: "assistant",
+          content: [{ type: "text", text: "ikinci cevap" }],
+        },
+      },
+    ]);
+
+    expect(prompts).toEqual(["bir", "iki"]);
+    // Each reply is closed before the next one opens, so the two turns stay
+    // separate blocks instead of folding into one long answer.
+    expect(events.map((e) => e.type)).toEqual([
+      "message.delta",
+      "message.completed",
+      "message.delta",
+      "message.completed",
+    ]);
+  });
+
+  it("skips subagent traffic and records that carry no conversation", () => {
+    const { events, prompts } = replay([
+      { type: "mode", mode: "normal" },
+      { type: "ai-title", aiTitle: "bir baslik" },
+      { type: "file-history-snapshot", snapshot: {} },
+      {
+        type: "assistant",
+        isSidechain: true,
+        message: {
+          role: "assistant",
+          content: [{ type: "text", text: "alt ajan" }],
+        },
+      },
+      { type: "user", message: { role: "user", content: "tek gercek mesaj" } },
+    ]);
+
+    expect(prompts).toEqual(["tek gercek mesaj"]);
+    expect(events).toEqual([]);
+  });
+
+  it("treats a tool result wearing the user role as a tool row, not a prompt", () => {
+    const { prompts } = replay([
+      {
+        type: "user",
+        message: {
+          role: "user",
+          content: [{ type: "tool_result", tool_use_id: "nope", content: "x" }],
+        },
+      },
+    ]);
+    expect(prompts).toEqual([]);
   });
 });
 
@@ -1271,9 +1415,9 @@ describe("claude background tasks", () => {
     });
     const items = groupTurnItems(session.blocks.slice(1));
     const group = items.at(-1);
-    expect(group?.type === "activity" && workSummaryLine(group.blocks, true)).toBe(
-      "Running in background",
-    );
+    expect(
+      group?.type === "activity" && workSummaryLine(group.blocks, true),
+    ).toBe("Running in background");
   });
 
   it("lets the turn go if a finished task never wakes Claude", async () => {
@@ -1465,5 +1609,53 @@ describe("claude manual compaction", () => {
       text: "Compacted context",
     });
     expect(events.some((event) => event.type === "message.delta")).toBe(false);
+  });
+});
+
+describe("claude replay bindings", () => {
+  // `handleLine` keys the resume binding to the directory replay is given, so
+  // an imported worktree thread has to be replayed against its checkout: a
+  // binding under the project root is dropped once the next turn runs in the
+  // checkout, and Claude starts a new conversation instead of continuing.
+  async function turnIn(cwd: string) {
+    const turn = sendClaudeTurn({
+      sessionId: "s1",
+      cwd,
+      model: "claude:claude-sonnet-5",
+      modelSettings: {},
+      runtimeMode: "supervised",
+      text: "devam",
+      attachments: [],
+      onEvent: () => undefined,
+    });
+    await waitFor(() => spawned.length === 1, "claude process");
+    void turn.catch(() => undefined);
+    return spawned[0] ?? [];
+  }
+
+  it("imports a worktree thread against its checkout", async () => {
+    const session = buildImportedSession({
+      base: {
+        ...newSession("claude", "/repo", "claude:claude-sonnet-5"),
+        id: "s1",
+        worktreeCwd: "/repo/.worktrees/a",
+      },
+      // Records reach `handleLine` in the shape the live stream sends, which
+      // is where the session id is read from.
+      transcript: JSON.stringify({
+        type: "assistant",
+        session_id: "stored-conv",
+        message: {
+          role: "assistant",
+          content: [{ type: "text", text: "cevap" }],
+        },
+      }),
+      providerSessionId: "stored-conv",
+    });
+    expect(session.providerSessionId).toBe("stored-conv");
+
+    const args = await turnIn("/repo/.worktrees/a");
+    expect(args).toEqual(expect.arrayContaining(["--resume", "stored-conv"]));
+    expect(args).not.toContain("--session-id");
   });
 });
